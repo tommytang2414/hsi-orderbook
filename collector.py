@@ -4,7 +4,7 @@ Streams real-time order book data and stores raw snapshots.
 """
 
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime
 import pytz
 from futu import OpenQuoteContext, OrderBookHandlerBase, SubType, RET_OK, RET_ERROR
 
@@ -12,48 +12,6 @@ from config import FUTU_HOST, FUTU_PORT, HSI_SYMBOL, ORDER_BOOK_LEVELS
 import db
 
 HK_TZ = pytz.timezone("Asia/Hong_Kong")
-
-MARKET_MORNING_START = dtime(9, 30)
-MARKET_MORNING_END = dtime(12, 0)
-MARKET_AFTERNOON_START = dtime(13, 0)
-MARKET_AFTERNOON_END = dtime(16, 0)
-CLEANUP_INTERVAL_SEC = 300
-
-
-def is_market_open() -> bool:
-    now = datetime.now(HK_TZ)
-    if now.weekday() >= 5:
-        return False
-    current_time = now.time()
-    morning = MARKET_MORNING_START <= current_time < MARKET_MORNING_END
-    afternoon = MARKET_AFTERNOON_START <= current_time < MARKET_AFTERNOON_END
-    return morning or afternoon
-
-
-def cleanup_invalid_data():
-    conn = db.get_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            DELETE FROM orderbook_snapshots 
-            WHERE (
-                EXTRACT(DOW FROM ts) IN (0, 6)
-                OR (EXTRACT(HOUR FROM ts) < 9)
-                OR (EXTRACT(HOUR FROM ts) >= 12 AND EXTRACT(HOUR FROM ts) < 13)
-                OR (EXTRACT(HOUR FROM ts) >= 16)
-                OR (EXTRACT(HOUR FROM ts) = 9 AND EXTRACT(MINUTE FROM ts) < 30)
-            )
-        """)
-        deleted = cur.rowcount
-        conn.commit()
-        if deleted > 0:
-            print(f"[Cleanup] Removed {deleted} invalid snapshots")
-    except Exception as e:
-        conn.rollback()
-        print(f"[Cleanup] Error: {e}")
-    finally:
-        cur.close()
-        conn.close()
 
 
 class HSIOrderBookHandler(OrderBookHandlerBase):
@@ -72,9 +30,6 @@ class HSIOrderBookHandler(OrderBookHandlerBase):
 
     def _process(self, data: dict):
         ts = datetime.now(HK_TZ)
-
-        if not is_market_open():
-            return
 
         raw_bids = data.get("Bid", [])
         raw_asks = data.get("Ask", [])
@@ -129,17 +84,6 @@ def run():
 
     try:
         from config import COLLECTION_SLEEP_SEC
-        import threading
-
-        def periodic_cleanup():
-            while True:
-                time.sleep(CLEANUP_INTERVAL_SEC)
-                if is_market_open():
-                    cleanup_invalid_data()
-
-        cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
-        cleanup_thread.start()
-
         time.sleep(COLLECTION_SLEEP_SEC)
     except KeyboardInterrupt:
         print("\n[Collector] Stopped by user.")
