@@ -1,6 +1,6 @@
 """
 Futu OpenD order book collector for HSI futures.
-Streams real-time order book data, computes metrics, and generates signals.
+Streams real-time order book data and stores raw snapshots.
 """
 
 import time
@@ -8,8 +8,7 @@ from datetime import datetime, time as dtime
 import pytz
 from futu import OpenQuoteContext, OrderBookHandlerBase, SubType, RET_OK, RET_ERROR
 
-from config import FUTU_HOST, FUTU_PORT, HSI_SYMBOL, ORDER_BOOK_LEVELS, SIGNAL_COOLDOWN_SEC
-from analyzer import compute_metrics, generate_signal, reset_buffers
+from config import FUTU_HOST, FUTU_PORT, HSI_SYMBOL, ORDER_BOOK_LEVELS
 import db
 
 HK_TZ = pytz.timezone("Asia/Hong_Kong")
@@ -45,35 +44,10 @@ def cleanup_invalid_data():
                 OR (EXTRACT(HOUR FROM ts) = 9 AND EXTRACT(MINUTE FROM ts) < 30)
             )
         """)
-        deleted_snap = cur.rowcount
-
-        cur.execute("""
-            DELETE FROM orderbook_metrics 
-            WHERE (
-                EXTRACT(DOW FROM ts) IN (0, 6)
-                OR (EXTRACT(HOUR FROM ts) < 9)
-                OR (EXTRACT(HOUR FROM ts) >= 12 AND EXTRACT(HOUR FROM ts) < 13)
-                OR (EXTRACT(HOUR FROM ts) >= 16)
-                OR (EXTRACT(HOUR FROM ts) = 9 AND EXTRACT(MINUTE FROM ts) < 30)
-            )
-        """)
-        deleted_met = cur.rowcount
-
-        cur.execute("""
-            DELETE FROM signals 
-            WHERE (
-                EXTRACT(DOW FROM ts) IN (0, 6)
-                OR (EXTRACT(HOUR FROM ts) < 9)
-                OR (EXTRACT(HOUR FROM ts) >= 12 AND EXTRACT(HOUR FROM ts) < 13)
-                OR (EXTRACT(HOUR FROM ts) >= 16)
-                OR (EXTRACT(HOUR FROM ts) = 9 AND EXTRACT(MINUTE FROM ts) < 30)
-            )
-        """)
-        deleted_sig = cur.rowcount
-
+        deleted = cur.rowcount
         conn.commit()
-        if deleted_snap > 0 or deleted_met > 0 or deleted_sig > 0:
-            print(f"[Cleanup] Removed {deleted_snap} snapshots, {deleted_met} metrics, {deleted_sig} signals")
+        if deleted > 0:
+            print(f"[Cleanup] Removed {deleted} invalid snapshots")
     except Exception as e:
         conn.rollback()
         print(f"[Cleanup] Error: {e}")
@@ -83,10 +57,6 @@ def cleanup_invalid_data():
 
 
 class HSIOrderBookHandler(OrderBookHandlerBase):
-    def __init__(self):
-        super().__init__()
-        self._last_signal_ts: datetime | None = None
-
     def on_recv_rsp(self, rsp_pb):
         ret_code, data = super().on_recv_rsp(rsp_pb)
         if ret_code != RET_OK:
@@ -106,7 +76,6 @@ class HSIOrderBookHandler(OrderBookHandlerBase):
         if not is_market_open():
             return
 
-        # Parse bid/ask levels
         raw_bids = data.get("Bid", [])
         raw_asks = data.get("Ask", [])
         n_levels = min(ORDER_BOOK_LEVELS, len(raw_bids), len(raw_asks))
@@ -124,54 +93,24 @@ class HSIOrderBookHandler(OrderBookHandlerBase):
                 "ask_volume": float(raw_asks[i][1]),
             })
 
-        # Persist raw snapshot
         db.insert_snapshot(ts, levels)
-
-        # Compute derived metrics
-        metrics = compute_metrics(levels)
-        db.insert_metrics(ts, metrics)
-
-        # Console output
-        self._print_status(ts, metrics)
-
-        # Signal generation with cooldown
-        direction, reason = generate_signal(metrics)
-        if direction and self._cooldown_ok(ts):
-            self._last_signal_ts = ts
-            db.insert_signal(ts, direction, reason, metrics)
-            self._print_signal(ts, direction, reason, metrics)
-
-    def _cooldown_ok(self, ts: datetime) -> bool:
-        if self._last_signal_ts is None:
-            return True
-        elapsed = (ts - self._last_signal_ts).total_seconds()
-        return elapsed >= SIGNAL_COOLDOWN_SEC
+        self._print_status(ts, levels)
 
     @staticmethod
-    def _print_status(ts: datetime, m: dict):
-        bid_z = f"{m['bid_zscore']:.2f}" if m["bid_zscore"] is not None else "N/A"
-        ask_z = f"{m['ask_zscore']:.2f}" if m["ask_zscore"] is not None else "N/A"
+    def _print_status(ts: datetime, levels: list):
+        best = levels[0]
+        total_bid = sum(l["bid_volume"] for l in levels)
+        total_ask = sum(l["ask_volume"] for l in levels)
+        spread = best["ask"] - best["bid"]
         print(
             f"[{ts.strftime('%H:%M:%S')}] "
-            f"Bid {m['best_bid']} ({m['total_bid_vol']:.0f}, Z={bid_z}) | "
-            f"Ask {m['best_ask']} ({m['total_ask_vol']:.0f}, Z={ask_z}) | "
-            f"Spread {m['spread']} | OBI {m['obi']:.3f}"
+            f"Bid {best['bid']} ({total_bid:.0f}) | "
+            f"Ask {best['ask']} ({total_ask:.0f}) | "
+            f"Spread {spread}"
         )
-
-    @staticmethod
-    def _print_signal(ts: datetime, direction: str, reason: str, m: dict):
-        tag = ">>> LONG <<<" if direction == "LONG" else "<<< SHORT >>>"
-        print(f"\n{'='*60}")
-        print(f"  SIGNAL: {tag}")
-        print(f"  Time  : {ts.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"  Reason: {reason}")
-        print(f"  Bid   : {m['best_bid']}  Ask: {m['best_ask']}")
-        print(f"  OBI   : {m['obi']:.4f}")
-        print(f"{'='*60}\n")
 
 
 def run():
-    reset_buffers()
     db.setup_tables()
 
     print(f"[Collector] Connecting to Futu OpenD at {FUTU_HOST}:{FUTU_PORT}...")
