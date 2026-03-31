@@ -4,12 +4,82 @@ Streams real-time order book data, computes metrics, and generates signals.
 """
 
 import time
-from datetime import datetime
+from datetime import datetime, time as dtime
+import pytz
 from futu import OpenQuoteContext, OrderBookHandlerBase, SubType, RET_OK, RET_ERROR
 
 from config import FUTU_HOST, FUTU_PORT, HSI_SYMBOL, ORDER_BOOK_LEVELS, SIGNAL_COOLDOWN_SEC
 from analyzer import compute_metrics, generate_signal, reset_buffers
 import db
+
+HK_TZ = pytz.timezone("Asia/Hong_Kong")
+
+MARKET_MORNING_START = dtime(9, 30)
+MARKET_MORNING_END = dtime(12, 0)
+MARKET_AFTERNOON_START = dtime(13, 0)
+MARKET_AFTERNOON_END = dtime(16, 0)
+CLEANUP_INTERVAL_SEC = 300
+
+
+def is_market_open() -> bool:
+    now = datetime.now(HK_TZ)
+    if now.weekday() >= 5:
+        return False
+    current_time = now.time()
+    morning = MARKET_MORNING_START <= current_time < MARKET_MORNING_END
+    afternoon = MARKET_AFTERNOON_START <= current_time < MARKET_AFTERNOON_END
+    return morning or afternoon
+
+
+def cleanup_invalid_data():
+    conn = db.get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            DELETE FROM orderbook_snapshots 
+            WHERE (
+                EXTRACT(DOW FROM ts) IN (0, 6)
+                OR (EXTRACT(HOUR FROM ts) < 9)
+                OR (EXTRACT(HOUR FROM ts) >= 12 AND EXTRACT(HOUR FROM ts) < 13)
+                OR (EXTRACT(HOUR FROM ts) >= 16)
+                OR (EXTRACT(HOUR FROM ts) = 9 AND EXTRACT(MINUTE FROM ts) < 30)
+            )
+        """)
+        deleted_snap = cur.rowcount
+
+        cur.execute("""
+            DELETE FROM orderbook_metrics 
+            WHERE (
+                EXTRACT(DOW FROM ts) IN (0, 6)
+                OR (EXTRACT(HOUR FROM ts) < 9)
+                OR (EXTRACT(HOUR FROM ts) >= 12 AND EXTRACT(HOUR FROM ts) < 13)
+                OR (EXTRACT(HOUR FROM ts) >= 16)
+                OR (EXTRACT(HOUR FROM ts) = 9 AND EXTRACT(MINUTE FROM ts) < 30)
+            )
+        """)
+        deleted_met = cur.rowcount
+
+        cur.execute("""
+            DELETE FROM signals 
+            WHERE (
+                EXTRACT(DOW FROM ts) IN (0, 6)
+                OR (EXTRACT(HOUR FROM ts) < 9)
+                OR (EXTRACT(HOUR FROM ts) >= 12 AND EXTRACT(HOUR FROM ts) < 13)
+                OR (EXTRACT(HOUR FROM ts) >= 16)
+                OR (EXTRACT(HOUR FROM ts) = 9 AND EXTRACT(MINUTE FROM ts) < 30)
+            )
+        """)
+        deleted_sig = cur.rowcount
+
+        conn.commit()
+        if deleted_snap > 0 or deleted_met > 0 or deleted_sig > 0:
+            print(f"[Cleanup] Removed {deleted_snap} snapshots, {deleted_met} metrics, {deleted_sig} signals")
+    except Exception as e:
+        conn.rollback()
+        print(f"[Cleanup] Error: {e}")
+    finally:
+        cur.close()
+        conn.close()
 
 
 class HSIOrderBookHandler(OrderBookHandlerBase):
@@ -31,7 +101,10 @@ class HSIOrderBookHandler(OrderBookHandlerBase):
         return RET_OK, data
 
     def _process(self, data: dict):
-        ts = datetime.now()
+        ts = datetime.now(HK_TZ)
+
+        if not is_market_open():
+            return
 
         # Parse bid/ask levels
         raw_bids = data.get("Bid", [])
@@ -116,8 +189,18 @@ def run():
     print(f"[Collector] Subscribed to {HSI_SYMBOL} order book. Streaming...")
 
     try:
-        # Keep alive for the trading session; adjust in config if needed
         from config import COLLECTION_SLEEP_SEC
+        import threading
+
+        def periodic_cleanup():
+            while True:
+                time.sleep(CLEANUP_INTERVAL_SEC)
+                if is_market_open():
+                    cleanup_invalid_data()
+
+        cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
+        cleanup_thread.start()
+
         time.sleep(COLLECTION_SLEEP_SEC)
     except KeyboardInterrupt:
         print("\n[Collector] Stopped by user.")
